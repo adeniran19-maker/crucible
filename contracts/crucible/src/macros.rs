@@ -127,6 +127,63 @@ macro_rules! assert_emitted {
     }};
 }
 
+/// Asserts that an event matching the given topic pattern (with wildcard support via the `_` symbol)
+/// and optional data payload was emitted by the contract.
+///
+/// Wildcard symbols (`symbol_short!("_")`, `symbol_short!("_")`) match any topic segment.
+///
+/// # Example
+///
+/// ```ignore
+/// assert_event_matches!(
+///     env,
+///     contract_id,
+///     (symbol_short!("transfer"), symbol_short!("_"), symbol_short!("_"))
+/// );
+///
+/// assert_event_matches!(
+///     env,
+///     contract_id,
+///     (symbol_short!("mint"), symbol_short!("_")),
+///     1000_u128
+/// );
+/// ```
+#[macro_export]
+macro_rules! assert_event_matches {
+    ($env:expr, $contract_id:expr, $topics:expr) => {{
+        extern crate std;
+        let __parsed = $env.events_parsed($topics);
+        let __want_contract: soroban_sdk::Address = $contract_id.clone();
+        let __matching = __parsed.iter().any(|ev| ev.contract == __want_contract);
+        assert!(
+            __matching,
+            "assert_event_matches! failed: no matching event found for contract {:?} with topic pattern {:?}",
+            __want_contract,
+            $topics
+        );
+    }};
+    ($env:expr, $contract_id:expr, $topics:expr, $data:expr) => {{
+        extern crate std;
+        use soroban_env_host::Compare as _;
+        use soroban_sdk::IntoVal as _;
+        let __env = $env.inner();
+        let __want_data: soroban_sdk::Val = ($data).into_val(__env);
+        let __parsed = $env.events_parsed($topics);
+        let __want_contract: soroban_sdk::Address = $contract_id.clone();
+        let __matching = __parsed.iter().any(|ev| {
+            ev.contract == __want_contract
+                && __env.compare(&ev.data, &__want_data) == Ok(core::cmp::Ordering::Equal)
+        });
+        assert!(
+            __matching,
+            "assert_event_matches! failed: no matching event found for contract {:?} with topic pattern {:?} and expected data payload {:?}",
+            __want_contract,
+            $topics,
+            __want_data
+        );
+    }};
+}
+
 /// Asserts that no events were emitted.
 ///
 /// # Example
@@ -217,9 +274,209 @@ macro_rules! assert_approx_eq {
              tolerance  = {:?}",
             __actual,
             __expected,
-            __diff,
-            __tolerance,
+             __diff,
+             __tolerance,
+         );
+     }};
+}
+
+/// Asserts that a storage entry does not exceed a configured byte threshold.
+///
+/// This is a best-effort heuristic: it estimates the serialized size of the
+/// value using Soroban's XDR wire-format approximations.  The exact size can
+/// vary slightly depending on the host implementation, but this provides a
+/// useful guard against deploying entries that exceed the 64KB Soroban ledger
+/// entry limit.
+///
+/// A warning is emitted (via `eprintln!`) when the entry exceeds 80% of the
+/// maximum capacity.
+///
+/// # Arguments
+///
+/// * `$value` - The value to assert the size of
+/// * `$max_bytes` - Maximum allowed size in bytes (defaults to 65536 = 64KB)
+///
+/// # Example
+///
+/// ```ignore
+/// use crucible::prelude::*;
+///
+/// let data: Vec<u32> = vec![1, 2, 3];
+/// assert_storage_entry_size_limit!(data, 1024);
+/// ```
+#[macro_export]
+macro_rules! assert_storage_entry_size_limit {
+    ($value:expr) => {{
+        const DEFAULT_MAX: usize = 65536;
+        $crate::assert_storage_entry_size_limit!($value, DEFAULT_MAX);
+    }};
+    ($value:expr, $max_bytes:expr) => {{
+        extern crate std;
+        let __size = $crate::storage_size::estimate_size(&$value);
+        let __max: usize = $max_bytes;
+        let __warn_threshold = (__max as f64 * 0.8) as usize;
+
+        if __size > __warn_threshold {
+            eprintln!(
+                "warning: storage entry size {} bytes exceeds 80% of {} byte limit",
+                __size, __max
+            );
+        }
+
+        assert!(
+            __size <= __max,
+            "assert_storage_entry_size_limit! failed: estimated size {} bytes exceeds {} byte limit.\n\
+             \n\
+             Value type : {ty}\n\
+             Value      : {value:?}",
+            __size,
+            __max,
+            ty = std::any::type_name_of_val(&$value),
+            value = $value,
         );
+    }};
+}
+
+/// Asserts that the recorded authorization tree matches a declared one exactly.
+///
+/// Soroban Protocol 21+ authorizes an invocation as a tree: a signature on a
+/// root call covers a specific set of sub-invocations. This macro checks the
+/// whole delegation graph — signer, contract, function, `require_auth_for_args`
+/// arguments, and nesting — rather than merely that some address signed
+/// something, which is what lets an under-authorized sub-invocation slip
+/// through a test and fail in production.
+///
+/// On failure it reports each divergence (missing, unexpected, or misplaced)
+/// with its path into the tree, followed by the tree the host actually
+/// recorded.
+///
+/// # Syntax
+///
+/// ```ignore
+/// assert_auth_tree!(env, [
+///     signer => contract.function(arg, ...),
+///     signer => contract.function(arg, ...) => [
+///         sub_contract.sub_function(arg, ...),
+///         sub_contract.other(arg, ...) => [ /* deeper still */ ],
+///     ],
+/// ]);
+/// ```
+///
+/// `signer` and `contract` are [`Address`](soroban_sdk::Address) expressions,
+/// `function` is a bare identifier naming the invoked function, and the
+/// arguments are the values the authorization covers.
+///
+/// # Example
+///
+/// ```ignore
+/// use crucible::prelude::*;
+///
+/// // `alice` signs the escrow release, which in turn moves tokens.
+/// escrow.release(&alice, &amount);
+/// assert_auth_tree!(env, [
+///     alice => escrow_id.release(alice.clone(), amount) => [
+///         token_id.transfer(escrow_id.clone(), bob.clone(), amount),
+///     ],
+/// ]);
+/// ```
+///
+/// # Panics
+///
+/// Panics with a full diagnostic when the recorded tree differs in any way.
+#[macro_export]
+macro_rules! assert_auth_tree {
+    ($env:expr, [ $($tt:tt)* ]) => {{
+        extern crate std;
+        let __env = $crate::assert_auth_tree!(@env $env);
+        let __expected: std::vec::Vec<$crate::auth_tree::ExpectedAuth> =
+            $crate::assert_auth_tree!(@entries __env, [] $($tt)*);
+        $crate::auth_tree::verify_auth_tree(__env, &__expected).assert_matches();
+    }};
+
+    // Accepts either a `MockEnv` or a bare `soroban_sdk::Env`.
+    (@env $env:expr) => {
+        $crate::auth_tree::AsAuthEnv::as_auth_env(&$env)
+    };
+
+    // ── Entry list ──────────────────────────────────────────────────────────
+    // Each entry is `signer => contract.function(args)` with optional
+    // `=> [ sub-invocations ]`, accumulated into `$acc`.
+
+    (@entries $env:expr, [$($acc:expr),*]) => {
+        std::vec![$($acc),*]
+    };
+    (@entries $env:expr, [$($acc:expr),*] $signer:expr => $contract:ident . $function:ident ( $($args:expr),* $(,)? ) => [ $($subs:tt)* ] $(, $($rest:tt)*)?) => {
+        $crate::assert_auth_tree!(@entries $env, [
+            $($acc,)*
+            $crate::auth_tree::ExpectedAuth {
+                address: ::core::clone::Clone::clone(&$signer),
+                invocation: $crate::assert_auth_tree!(
+                    @node $env, $contract . $function ( $($args),* ) => [ $($subs)* ]
+                ),
+            }
+        ] $($($rest)*)?)
+    };
+    (@entries $env:expr, [$($acc:expr),*] $signer:expr => $contract:ident . $function:ident ( $($args:expr),* $(,)? ) $(, $($rest:tt)*)?) => {
+        $crate::assert_auth_tree!(@entries $env, [
+            $($acc,)*
+            $crate::auth_tree::ExpectedAuth {
+                address: ::core::clone::Clone::clone(&$signer),
+                invocation: $crate::assert_auth_tree!(
+                    @node $env, $contract . $function ( $($args),* )
+                ),
+            }
+        ] $($($rest)*)?)
+    };
+
+    // ── Sub-invocation list ─────────────────────────────────────────────────
+
+    (@nodes $env:expr, [$($acc:expr),*]) => {
+        std::vec![$($acc),*]
+    };
+    (@nodes $env:expr, [$($acc:expr),*] $contract:ident . $function:ident ( $($args:expr),* $(,)? ) => [ $($subs:tt)* ] $(, $($rest:tt)*)?) => {
+        $crate::assert_auth_tree!(@nodes $env, [
+            $($acc,)*
+            $crate::assert_auth_tree!(
+                @node $env, $contract . $function ( $($args),* ) => [ $($subs)* ]
+            )
+        ] $($($rest)*)?)
+    };
+    (@nodes $env:expr, [$($acc:expr),*] $contract:ident . $function:ident ( $($args:expr),* $(,)? ) $(, $($rest:tt)*)?) => {
+        $crate::assert_auth_tree!(@nodes $env, [
+            $($acc,)*
+            $crate::assert_auth_tree!(@node $env, $contract . $function ( $($args),* ))
+        ] $($($rest)*)?)
+    };
+
+    // ── Single node ─────────────────────────────────────────────────────────
+
+    (@node $env:expr, $contract:ident . $function:ident ( $($args:expr),* $(,)? ) => [ $($subs:tt)* ]) => {
+        $crate::auth_tree::ExpectedInvocation::new(
+            ::core::clone::Clone::clone(&$contract),
+            soroban_sdk::Symbol::new($env, stringify!($function)),
+            $crate::assert_auth_tree!(@args $env, $($args),*),
+        )
+        .with_sub_invocations($crate::assert_auth_tree!(@nodes $env, [] $($subs)*))
+    };
+    (@node $env:expr, $contract:ident . $function:ident ( $($args:expr),* $(,)? )) => {
+        $crate::auth_tree::ExpectedInvocation::new(
+            ::core::clone::Clone::clone(&$contract),
+            soroban_sdk::Symbol::new($env, stringify!($function)),
+            $crate::assert_auth_tree!(@args $env, $($args),*),
+        )
+    };
+
+    // Arguments are converted individually so each may have its own type.
+    (@args $env:expr, $($args:expr),* $(,)?) => {{
+        #[allow(unused_mut)]
+        let mut __args = soroban_sdk::Vec::<soroban_sdk::Val>::new($env);
+        $(
+            __args.push_back(soroban_sdk::IntoVal::<
+                soroban_sdk::Env,
+                soroban_sdk::Val,
+            >::into_val(&$args, $env));
+        )*
+        __args
     }};
 }
 
